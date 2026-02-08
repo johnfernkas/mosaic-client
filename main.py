@@ -1,223 +1,183 @@
 """
-Mosaic Client for Interstate 75W
+Mosaic Client
 
-Main entry point and event loop for the Mosaic LED display client.
-Connects to WiFi, fetches frames from the Mosaic server, and displays them.
+Fetches and displays frames from a Mosaic server on HUB75 LED matrices.
 """
 
 import time
-import sys
-
-# Import our modules
-from network import connect_wifi, fetch_frame, check_server_health, register_display
-from display import MosaicDisplay, debug_print
+import network
+import urequests
 from config import (
-    FRAME_FETCH_RETRY_ATTEMPTS,
-    FRAME_FETCH_RETRY_DELAY,
-    ERROR_DISPLAY_TIME,
-    DEFAULT_DWELL_SECS,
-    DISPLAY_WIDTH,
-    DISPLAY_HEIGHT,
+    WIFI_SSID, WIFI_PASSWORD, WIFI_CONNECT_TIMEOUT,
+    SERVER_URL, DISPLAY_ID, BRIGHTNESS
 )
+try:
+    from config import DISPLAY_NAME
+except:
+    DISPLAY_NAME = DISPLAY_ID or "Mosaic Display"
+from display import Display
 
 
-def parse_frame_data(pixel_bytes, frame_count, width, height):
-    """
-    Parse raw RGB bytes into individual frames.
-
-    Args:
-        pixel_bytes: Raw RGB bytes from server
-        frame_count: Number of frames in the data
-        width: Frame width in pixels
-        height: Frame height in pixels
-
-    Returns:
-        list: List of frame byte objects, or None if parsing fails
-    """
-    try:
-        bytes_per_frame = width * height * 3
-        total_expected = bytes_per_frame * frame_count
-
-        if len(pixel_bytes) < total_expected:
-            print(f"ERROR: Received only {len(pixel_bytes)} bytes, "
-                  f"expected {total_expected} for {frame_count} frame(s)")
-            return None
-
-        frames = []
-        for i in range(frame_count):
-            start = i * bytes_per_frame
-            end = start + bytes_per_frame
-            frames.append(pixel_bytes[start:end])
-
-        return frames
-
-    except Exception as e:
-        print(f"ERROR: Failed to parse frame data: {e}")
-        return None
-
-
-def main():
-    """
-    Main application loop.
-
-    1. Connect to WiFi
-    2. Continuously fetch and display frames from Mosaic server
-    3. Handle animations (multiple frames with delays)
-    4. Handle errors gracefully
-    """
-
-    print("\n" + "="*60)
-    print("  MOSAIC CLIENT for Interstate 75W")
-    print("="*60 + "\n")
-
-    # Initialize display
-    try:
-        display = MosaicDisplay()
-    except Exception as e:
-        print(f"FATAL: Cannot initialize display: {e}")
-        sys.exit(1)
-
-    # Connect to WiFi
-    if not connect_wifi():
-        print("\nERROR: Failed to connect to WiFi")
-        display.show_error_pattern("connection")
-        time.sleep(5)
-        display.cleanup()
-        sys.exit(1)
-
-    # Check server connectivity
-    print("Checking Mosaic server...")
-    if not check_server_health():
-        print("WARNING: Mosaic server is not responding")
-        display.show_error_pattern("connection")
-        time.sleep(5)
-
-    # Attempt to register display (optional, non-fatal if it fails)
-    register_display()
-
-    # Main event loop
-    try:
-        print("\n" + "="*60)
-        print("  RUNNING - Fetching frames from Mosaic server")
-        print("="*60 + "\n")
-
-        retry_count = 0
-        last_frame_time = 0
-        current_dwell_secs = DEFAULT_DWELL_SECS
-
+class MosaicClient:
+    """Main client controller."""
+    
+    def __init__(self):
+        # Initialize display immediately for visual feedback
+        self.display = Display(brightness=BRIGHTNESS)
+        self.display.boot_screen()
+        
+        # State
+        self.frames = None
+        self.frame_count = 1
+        self.frame_delay = 100
+        self.dwell_secs = 10
+        self.last_fetch = 0
+        self.current_frame = 0
+        self.last_frame_time = 0
+    
+    def connect_wifi(self):
+        """Connect to WiFi network."""
+        self.display.wifi_connecting()
+        
+        wlan = network.WLAN(network.STA_IF)
+        wlan.active(True)
+        
+        if wlan.isconnected():
+            ip = wlan.ifconfig()[0]
+            self.display.wifi_connected(ip)
+            time.sleep(0.5)
+            return True
+        
+        wlan.disconnect()
+        time.sleep(0.5)
+        wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+        
+        start = time.time()
+        while not wlan.isconnected():
+            if time.time() - start > WIFI_CONNECT_TIMEOUT:
+                self.display.wifi_failed()
+                return False
+            time.sleep(0.5)
+        
+        ip = wlan.ifconfig()[0]
+        self.display.wifi_connected(ip)
+        time.sleep(0.5)
+        return True
+    
+    def register_display(self):
+        """Register this display with the server."""
+        if not DISPLAY_ID:
+            return True  # Skip if no display ID configured
+        
+        try:
+            url = f"{SERVER_URL}/api/displays"
+            data = {
+                "id": DISPLAY_ID,
+                "name": DISPLAY_NAME,
+                "width": self.display.width,
+                "height": self.display.height
+            }
+            
+            # MicroPython urequests needs json as string
+            import json
+            response = urequests.post(url, 
+                data=json.dumps(data),
+                headers={"Content-Type": "application/json"},
+                timeout=10)
+            response.close()
+            return True
+        except Exception as e:
+            print(f"Registration failed: {e}")
+            return False
+    
+    def fetch_frame(self):
+        """Fetch frame data from server."""
+        try:
+            url = f"{SERVER_URL}/frame"
+            if DISPLAY_ID:
+                url += f"?display={DISPLAY_ID}"
+            
+            response = urequests.get(url, timeout=10)
+            
+            if response.status_code != 200:
+                return False
+            
+            # Parse headers (MicroPython uses lowercase)
+            h = response.headers
+            self.frame_count = int(h.get("x-frame-count") or h.get("X-Frame-Count") or "1")
+            self.frame_delay = int(h.get("x-frame-delay-ms") or h.get("X-Frame-Delay-Ms") or "100")
+            self.dwell_secs = int(h.get("x-dwell-secs") or h.get("X-Dwell-Secs") or "10")
+            
+            # Update brightness from server
+            brightness = h.get("x-brightness") or h.get("X-Brightness")
+            if brightness:
+                self.display.brightness = int(brightness)
+            
+            self.frames = response.content
+            self.last_fetch = time.time()
+            self.current_frame = 0
+            
+            response.close()
+            return True
+            
+        except Exception as e:
+            print(f"Fetch error: {e}")
+            return False
+    
+    def should_fetch(self):
+        """Check if we need new frame data."""
+        if self.frames is None:
+            return True
+        return (time.time() - self.last_fetch) >= self.dwell_secs
+    
+    def display_current_frame(self):
+        """Display the current animation frame."""
+        if self.frames is None:
+            return
+        
+        frame_size = self.display.width * self.display.height * 3
+        offset = self.current_frame * frame_size
+        
+        if offset + frame_size <= len(self.frames):
+            frame_data = self.frames[offset:offset + frame_size]
+            self.display.show_frame(frame_data)
+    
+    def run(self):
+        """Main loop."""
+        # Connect to WiFi
+        if not self.connect_wifi():
+            time.sleep(5)
+            return  # Will restart via main.py loop
+        
+        # Register with server
+        self.display.server_connecting()
+        self.register_display()
+        
+        # Main loop
         while True:
-            try:
-                # Time to fetch a new frame
-                current_time = time.time()
-
-                if current_time - last_frame_time >= current_dwell_secs:
-                    # Fetch frame from server with retries
-                    pixel_data = None
-                    headers = None
-
-                    for attempt in range(FRAME_FETCH_RETRY_ATTEMPTS):
-                        pixel_data, headers = fetch_frame()
-
-                        if pixel_data is not None:
-                            break
-
-                        if attempt < FRAME_FETCH_RETRY_ATTEMPTS - 1:
-                            print(f"Retry {attempt + 1}/{FRAME_FETCH_RETRY_ATTEMPTS - 1} "
-                                  f"in {FRAME_FETCH_RETRY_DELAY}s...")
-                            time.sleep(FRAME_FETCH_RETRY_DELAY)
-
-                    # Handle fetch failure
-                    if pixel_data is None:
-                        print("ERROR: Failed to fetch frame after all retries")
-                        display.show_error_pattern("connection")
-                        time.sleep(ERROR_DISPLAY_TIME)
-                        retry_count += 1
-                        current_dwell_secs = DEFAULT_DWELL_SECS
-                        last_frame_time = current_time
-                        continue
-
-                    # Parse frame data
-                    frame_count = headers.get("frame_count", 1)
-                    frame_delay_ms = headers.get("delay_ms", 100)
-                    current_dwell_secs = headers.get("dwell_secs", DEFAULT_DWELL_SECS)
-
-                    # Validate dimensions match
-                    server_width = headers.get("width", DISPLAY_WIDTH)
-                    server_height = headers.get("height", DISPLAY_HEIGHT)
-
-                    if server_width != DISPLAY_WIDTH or server_height != DISPLAY_HEIGHT:
-                        print(f"ERROR: Server frame size {server_width}x{server_height} "
-                              f"does not match display {DISPLAY_WIDTH}x{DISPLAY_HEIGHT}")
-                        display.show_error_pattern("format")
-                        time.sleep(ERROR_DISPLAY_TIME)
-                        current_dwell_secs = DEFAULT_DWELL_SECS
-                        last_frame_time = current_time
-                        continue
-
-                    # Parse frames
-                    frames = parse_frame_data(
-                        pixel_data,
-                        frame_count,
-                        server_width,
-                        server_height
-                    )
-
-                    if frames is None:
-                        print("ERROR: Failed to parse frame data")
-                        display.show_error_pattern("format")
-                        time.sleep(ERROR_DISPLAY_TIME)
-                        current_dwell_secs = DEFAULT_DWELL_SECS
-                        last_frame_time = current_time
-                        continue
-
-                    # Display animation frames
-                    debug_print(f"Displaying {frame_count} frame(s) "
-                               f"from app: {headers.get('app_name', 'unknown')}")
-
-                    animation_start = time.time()
-                    frame_index = 0
-
-                    while True:
-                        # Display current frame
-                        display.display_frame(frames[frame_index])
-
-                        # Timing for next frame
-                        frame_index += 1
-                        if frame_index >= frame_count:
-                            # Animation complete, will fetch new frame next time
-                            break
-
-                        # Wait for frame delay (in milliseconds)
-                        delay_seconds = frame_delay_ms / 1000.0
-                        time.sleep(delay_seconds)
-
-                    # Update dwell timer after showing animation
-                    last_frame_time = time.time()
-                    retry_count = 0  # Reset retry counter on success
-
-                else:
-                    # Still in dwell period, just sleep a bit
-                    time.sleep(0.1)
-
-            except KeyboardInterrupt:
-                print("\n\nInterrupted by user")
-                break
-
-            except Exception as e:
-                print(f"Unexpected error in main loop: {e}")
-                import traceback
-                traceback.print_exc()
-                display.show_error_pattern("connection")
-                time.sleep(ERROR_DISPLAY_TIME)
-                current_dwell_secs = DEFAULT_DWELL_SECS
-                last_frame_time = time.time()
-
-    finally:
-        # Cleanup on exit
-        print("\n\nShutting down...")
-        display.cleanup()
-        print("Done!")
+            # Fetch new frame if needed
+            if self.should_fetch():
+                if not self.fetch_frame():
+                    self.display.server_error()
+                    time.sleep(3)
+                    continue
+            
+            # Display animation frame
+            now = time.ticks_ms()
+            if time.ticks_diff(now, self.last_frame_time) >= self.frame_delay:
+                self.display_current_frame()
+                self.current_frame = (self.current_frame + 1) % self.frame_count
+                self.last_frame_time = now
+            
+            time.sleep_ms(10)
 
 
+# Entry point
 if __name__ == "__main__":
-    main()
+    while True:
+        try:
+            client = MosaicClient()
+            client.run()
+        except Exception as e:
+            print(f"Error: {e}")
+            time.sleep(5)

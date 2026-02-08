@@ -1,222 +1,250 @@
 """
-LED Matrix Display Module
+Mosaic Display Module
 
-Manages the HUB75 display using Pimoroni's Hub75 library.
-Handles pixel rendering, color conversion, and error patterns.
+Hardware-abstracted LED matrix display controller.
 """
 
-from hub75 import Hub75
 import time
-from config import (
-    DISPLAY_WIDTH,
-    DISPLAY_HEIGHT,
-    GPIO_CONFIG,
-    BRIGHTNESS,
-    DISPLAY_ENABLED,
-    DEBUG,
-)
+
+try:
+    import random
+except:
+    random = None
+
+try:
+    from interstate75 import Interstate75, DISPLAY_INTERSTATE75_64X32
+    HARDWARE = "interstate75"
+except ImportError:
+    HARDWARE = None
 
 
-def debug_print(msg):
-    """Print debug messages if debugging is enabled."""
-    if DEBUG:
-        print(f"[DISPLAY] {msg}")
+class Display:
+    """LED matrix display controller."""
 
-
-class MosaicDisplay:
-    """
-    HUB75 LED matrix display controller.
-    """
-
-    def __init__(self):
-        """Initialize the display with configured GPIO pins."""
-        debug_print(f"Initializing {DISPLAY_WIDTH}x{DISPLAY_HEIGHT} HUB75 display")
-
-        try:
-            # Create the hub75 display with configured GPIO pins
-            self.display = Hub75(
-                width=DISPLAY_WIDTH,
-                height=DISPLAY_HEIGHT,
-                r0=GPIO_CONFIG["R0"],
-                r1=GPIO_CONFIG["R1"],
-                g0=GPIO_CONFIG["G0"],
-                g1=GPIO_CONFIG["G1"],
-                b0=GPIO_CONFIG["B0"],
-                b1=GPIO_CONFIG["B1"],
-                a=GPIO_CONFIG["A"],
-                b=GPIO_CONFIG["B"],
-                c=GPIO_CONFIG["C"],
-                d=GPIO_CONFIG["D"],
-                e=GPIO_CONFIG["E"],
-                clk=GPIO_CONFIG["CLK"],
-                stb=GPIO_CONFIG["STB"],
-                oe=GPIO_CONFIG["OE"],
-            )
-
-            # Set brightness
-            self.set_brightness(BRIGHTNESS)
-
-            # Enable/disable the display
-            if DISPLAY_ENABLED:
-                self.display.start()
-                debug_print("Display enabled and started")
-            else:
-                debug_print("Display initialized but disabled")
-
-            self.enabled = DISPLAY_ENABLED
-            self.current_brightness = BRIGHTNESS
-
-        except Exception as e:
-            print(f"ERROR: Failed to initialize display: {e}")
-            print("Ensure the Hub75 library is installed and GPIO pins are correct.")
-            raise
-
-    def set_brightness(self, brightness):
-        """
-        Set the display brightness (0-255).
-
-        Args:
-            brightness: Brightness value from 0 (off) to 255 (full)
-        """
-        try:
-            # Clamp to valid range
-            brightness = max(0, min(255, brightness))
-
-            # The Hub75 library uses 0-255 range
-            self.display.set_brightness(brightness)
-            self.current_brightness = brightness
-
-            debug_print(f"Brightness set to {brightness}")
-
-        except Exception as e:
-            print(f"Warning: Failed to set brightness: {e}")
-
-    def enable(self):
-        """Enable the display."""
-        if not self.enabled:
+    def __init__(self, width=64, height=32, brightness=80):
+        self.width = width
+        self.height = height
+        self.brightness = brightness
+        self._init_hardware()
+        
+    def _init_hardware(self):
+        """Initialize display hardware."""
+        if HARDWARE == "interstate75":
+            self.i75 = Interstate75(display=DISPLAY_INTERSTATE75_64X32)
+            self.graphics = self.i75.display
+            bounds = self.graphics.get_bounds()
+            self.width = bounds[0]
+            self.height = bounds[1]
+        else:
+            raise RuntimeError("No supported display hardware found")
+    
+    def update(self):
+        """Push buffer to display."""
+        if HARDWARE == "interstate75":
+            self.i75.update()
+    
+    def clear(self, color=(0, 0, 0)):
+        """Fill display with solid color."""
+        pen = self.graphics.create_pen(color[0], color[1], color[2])
+        self.graphics.set_pen(pen)
+        self.graphics.clear()
+    
+    def pixel(self, x, y, r, g, b):
+        """Set a single pixel."""
+        scale = self.brightness / 100.0
+        pen = self.graphics.create_pen(
+            int(r * scale),
+            int(g * scale),
+            int(b * scale)
+        )
+        self.graphics.set_pen(pen)
+        self.graphics.pixel(x, y)
+    
+    def rect(self, x, y, w, h, r, g, b):
+        """Draw filled rectangle."""
+        for py in range(y, y + h):
+            for px in range(x, x + w):
+                if 0 <= px < self.width and 0 <= py < self.height:
+                    self.pixel(px, py, r, g, b)
+    
+    def text(self, message, x, y, color=(255, 255, 255)):
+        """Draw text on display."""
+        scale = self.brightness / 100.0
+        pen = self.graphics.create_pen(
+            int(color[0] * scale),
+            int(color[1] * scale),
+            int(color[2] * scale)
+        )
+        self.graphics.set_pen(pen)
+        self.graphics.text(message, x, y, -1, 1)
+    
+    def show_frame(self, rgb_data):
+        """Display RGB frame data."""
+        expected = self.width * self.height * 3
+        if len(rgb_data) < expected:
+            return False
+        
+        idx = 0
+        for y in range(self.height):
+            for x in range(self.width):
+                self.pixel(x, y, rgb_data[idx], rgb_data[idx+1], rgb_data[idx+2])
+                idx += 3
+        
+        self.update()
+        return True
+    
+    # -------------------------------------------------------------------------
+    # Boot & Status Screens
+    # -------------------------------------------------------------------------
+    
+    def boot_screen(self):
+        """Mosaic tile animation on boot."""
+        # Tile colors - vibrant mosaic palette
+        colors = [
+            (0, 200, 255),   # cyan
+            (255, 0, 150),   # magenta
+            (255, 200, 0),   # gold
+            (0, 255, 100),   # green
+            (150, 0, 255),   # purple
+            (255, 100, 0),   # orange
+        ]
+        
+        tile_size = 4
+        tiles_x = self.width // tile_size
+        tiles_y = self.height // tile_size
+        
+        # Create list of all tile positions
+        tiles = [(x, y) for y in range(tiles_y) for x in range(tiles_x)]
+        
+        # Shuffle if random available, otherwise use diagonal pattern
+        if random:
             try:
-                self.display.start()
-                self.enabled = True
-                debug_print("Display enabled")
-            except Exception as e:
-                print(f"Warning: Failed to enable display: {e}")
-
-    def disable(self):
-        """Disable the display (blank screen, lower power)."""
-        if self.enabled:
-            try:
-                self.display.stop()
-                self.enabled = False
-                debug_print("Display disabled")
-            except Exception as e:
-                print(f"Warning: Failed to disable display: {e}")
-
-    def clear(self):
-        """Clear the display (fill with black)."""
-        try:
-            # Create a black frame (all zeros)
-            black_frame = bytearray(DISPLAY_WIDTH * DISPLAY_HEIGHT * 3)
-            self.display_frame(black_frame)
-            debug_print("Display cleared")
-        except Exception as e:
-            print(f"Warning: Failed to clear display: {e}")
-
-    def display_frame(self, rgb_pixels):
-        """
-        Display a frame of RGB pixel data.
-
-        Args:
-            rgb_pixels: Bytes object containing RGB pixel data (width*height*3 bytes)
-                       in format: [R0G0B0, R1G1B1, R2G2B2, ...]
-        """
-        if not self.enabled:
-            return
-
-        try:
-            # Ensure we have the right amount of data
-            expected_size = DISPLAY_WIDTH * DISPLAY_HEIGHT * 3
-            if len(rgb_pixels) < expected_size:
-                print(f"Warning: Received only {len(rgb_pixels)} bytes, expected {expected_size}")
-                return
-
-            # Convert RGB bytes to pixel data for the display
-            # The Hub75 library expects pixels to be set via indexing
-            pixels = self.display
-            pixel_idx = 0
-
-            for y in range(DISPLAY_HEIGHT):
-                for x in range(DISPLAY_WIDTH):
-                    r = rgb_pixels[pixel_idx]
-                    g = rgb_pixels[pixel_idx + 1]
-                    b = rgb_pixels[pixel_idx + 2]
-                    pixel_idx += 3
-
-                    # Set the pixel (RGB values are 0-255)
-                    pixels.set_pixel(x, y, r, g, b)
-
-            # Update the display with the new frame
-            self.display.update()
-
-        except Exception as e:
-            print(f"Error displaying frame: {e}")
-
-    def show_error_pattern(self, error_type="connection"):
-        """
-        Display an error pattern on the LED matrix.
-
-        Args:
-            error_type: Type of error ("connection", "format", "timeout")
-        """
-        if not self.enabled:
-            return
-
-        try:
-            pixels = self.display
-
-            if error_type == "connection":
-                # Red checkerboard pattern for connection errors
-                for y in range(DISPLAY_HEIGHT):
-                    for x in range(DISPLAY_WIDTH):
-                        if (x + y) % 2 == 0:
-                            pixels.set_pixel(x, y, 255, 0, 0)  # Red
-                        else:
-                            pixels.set_pixel(x, y, 0, 0, 0)  # Black
-
-            elif error_type == "format":
-                # Yellow horizontal lines for format errors
-                for y in range(DISPLAY_HEIGHT):
-                    for x in range(DISPLAY_WIDTH):
-                        if y % 2 == 0:
-                            pixels.set_pixel(x, y, 255, 255, 0)  # Yellow
-                        else:
-                            pixels.set_pixel(x, y, 0, 0, 0)  # Black
-
-            elif error_type == "timeout":
-                # Purple scrolling pattern for timeout
-                for y in range(DISPLAY_HEIGHT):
-                    for x in range(DISPLAY_WIDTH):
-                        if x % 4 == 0:
-                            pixels.set_pixel(x, y, 255, 0, 255)  # Magenta
-                        else:
-                            pixels.set_pixel(x, y, 0, 0, 0)  # Black
-
-            else:
-                # Default: flashing red
-                for y in range(DISPLAY_HEIGHT):
-                    for x in range(DISPLAY_WIDTH):
-                        pixels.set_pixel(x, y, 255, 0, 0)  # Red
-
-            self.display.update()
-            debug_print(f"Error pattern displayed: {error_type}")
-
-        except Exception as e:
-            print(f"Error displaying error pattern: {e}")
-
-    def cleanup(self):
-        """Clean up display resources."""
-        try:
-            self.clear()
-            self.disable()
-            debug_print("Display cleaned up")
-        except Exception as e:
-            print(f"Warning: Error during cleanup: {e}")
+                random.shuffle(tiles)
+            except:
+                pass
+        
+        # Fill tiles one by one with animation
+        self.clear()
+        for i, (tx, ty) in enumerate(tiles):
+            color = colors[i % len(colors)]
+            self.rect(tx * tile_size, ty * tile_size, tile_size, tile_size, *color)
+            if i % 8 == 0:  # Update every 8 tiles for speed
+                self.update()
+                time.sleep_ms(10)
+        
+        self.update()
+        time.sleep(0.3)
+        
+        # Fade to show "MOSAIC" branding
+        self._show_logo()
+    
+    def _show_logo(self):
+        """Show MOSAIC logo screen."""
+        self.clear((10, 10, 20))
+        
+        # Draw decorative mosaic tiles in corners
+        colors = [(0, 200, 255), (255, 0, 150), (255, 200, 0), (0, 255, 100)]
+        
+        # Top-left corner tiles
+        self.rect(0, 0, 3, 3, *colors[0])
+        self.rect(4, 0, 3, 3, *colors[1])
+        self.rect(0, 4, 3, 3, *colors[2])
+        
+        # Top-right corner tiles
+        self.rect(57, 0, 3, 3, *colors[1])
+        self.rect(61, 0, 3, 3, *colors[0])
+        self.rect(61, 4, 3, 3, *colors[3])
+        
+        # Bottom-left corner tiles
+        self.rect(0, 25, 3, 3, *colors[3])
+        self.rect(0, 29, 3, 3, *colors[0])
+        self.rect(4, 29, 3, 3, *colors[2])
+        
+        # Bottom-right corner tiles
+        self.rect(57, 29, 3, 3, *colors[2])
+        self.rect(61, 29, 3, 3, *colors[1])
+        self.rect(61, 25, 3, 3, *colors[0])
+        
+        # Center text "MOSAIC"
+        self.text("MOSAIC", 11, 12, (255, 255, 255))
+        
+        self.update()
+        time.sleep(0.8)
+    
+    def wifi_connecting(self):
+        """Show WiFi connecting screen."""
+        self._status_screen("WiFi", (255, 200, 0), dots=True)
+    
+    def wifi_connected(self, ip):
+        """Show WiFi connected."""
+        self._status_screen("WiFi OK", (0, 255, 100))
+        time.sleep(0.3)
+    
+    def wifi_failed(self):
+        """Show WiFi error."""
+        self._status_screen("No WiFi", (255, 50, 50))
+    
+    def server_connecting(self):
+        """Show server connecting."""
+        self._status_screen("Server", (255, 200, 0), dots=True)
+    
+    def server_error(self):
+        """Show server error with mosaic pattern."""
+        self.clear((20, 0, 0))
+        
+        # Draw warning mosaic pattern
+        for y in range(0, self.height, 4):
+            for x in range(0, self.width, 4):
+                if (x + y) % 8 == 0:
+                    self.rect(x, y, 3, 3, 255, 100, 0)
+        
+        self.text("ERROR", 17, 12, (255, 255, 255))
+        self.update()
+    
+    def _status_screen(self, message, color, dots=False):
+        """Generic status screen with centered text."""
+        self.clear((10, 10, 20))
+        
+        # Draw accent bar at top
+        self.rect(0, 0, self.width, 2, *color)
+        
+        # Draw small mosaic accent in corners
+        self.rect(0, 0, 4, 4, *color)
+        self.rect(60, 0, 4, 4, *color)
+        
+        # Center the message (approximate - 6px per char)
+        text_width = len(message) * 6
+        x = (self.width - text_width) // 2
+        
+        self.text(message, x, 13, color)
+        
+        if dots:
+            # Animated dots below
+            self.text("...", 28, 22, (100, 100, 100))
+        
+        self.update()
+    
+    def _hsv_to_rgb(self, h, s, v):
+        """Convert HSV to RGB (h: 0-255, s: 0-255, v: 0-255)."""
+        if s == 0:
+            return v, v, v
+        
+        region = h // 43
+        remainder = (h - (region * 43)) * 6
+        
+        p = (v * (255 - s)) >> 8
+        q = (v * (255 - ((s * remainder) >> 8))) >> 8
+        t = (v * (255 - ((s * (255 - remainder)) >> 8))) >> 8
+        
+        if region == 0:
+            return v, t, p
+        elif region == 1:
+            return q, v, p
+        elif region == 2:
+            return p, v, t
+        elif region == 3:
+            return p, q, v
+        elif region == 4:
+            return t, p, v
+        else:
+            return v, p, q
